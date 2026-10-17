@@ -17,6 +17,8 @@ const message = document.getElementById("message");
 const loginMessage = document.getElementById("login-message");
 
 let socket = null;
+let refreshPromise = null;
+let refreshTimer = null;
 
 // Show a message
 function showMessage(text) {
@@ -29,20 +31,40 @@ function updateStatus(text, connected = false) {
     status.classList.toggle("connected", connected);
 }
 
-// Check if JWT has expired
-function tokenExpired(token) {
+// Save tokens
+function saveTokens(access, refresh) {
+    localStorage.setItem("accessToken", access);
+    localStorage.setItem("refreshToken", refresh);
+}
+
+// Remove tokens
+function clearTokens() {
+    localStorage.removeItem("accessToken");
+    localStorage.removeItem("refreshToken");
+
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+}
+
+// Read JWT expiration
+function getTokenExpiry(token) {
     try {
         const payload = JSON.parse(atob(
             token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")
         ));
 
-        return !payload.exp || Date.now() >= payload.exp * 1000;
+        return payload.exp * 1000 || 0;
     } catch {
-        return true;
+        return 0;
     }
 }
 
-// Show login page
+// Check expiration
+function tokenExpired(token) {
+    return !token || Date.now() >= getTokenExpiry(token);
+}
+
+// Show login
 function showLogin(text = "") {
     loginSection.hidden = false;
     pastebinSection.hidden = true;
@@ -50,34 +72,139 @@ function showLogin(text = "") {
     updateStatus("Disconnected");
 }
 
-// Connect to WebSocket
-function connectWebSocket() {
-    const token = localStorage.getItem("accessToken");
+// Close WebSocket
+function disconnectWebSocket() {
+    if (socket) {
+        const oldSocket = socket;
+        socket = null;
 
-    if (!token || tokenExpired(token)) {
-        localStorage.removeItem("accessToken");
-        showLogin("Session expired. Please log in again.");
+        oldSocket.onclose = null;
+        oldSocket.onerror = null;
+        oldSocket.close();
+    }
+
+    updateStatus("Disconnected");
+}
+
+// Refresh access token
+async function refreshAccessToken() {
+    if (refreshPromise) {
+        return refreshPromise;
+    }
+
+    refreshPromise = (async () => {
+        const refreshToken = localStorage.getItem("refreshToken");
+
+        if (!refreshToken || tokenExpired(refreshToken)) {
+            return false;
+        }
+
+        try {
+            const response = await fetch(`${API_URL}/refresh`, {
+                method: "POST",
+                headers: {
+                    "jwtRef": `Bearer ${refreshToken}`
+                }
+            });
+
+            if (!response.ok) {
+                return false;
+            }
+
+            const data = await response.json();
+
+            if (!data.jwtAccess) {
+                return false;
+            }
+
+            saveTokens(
+                data.jwtAccess,
+                data.jwtRef || refreshToken
+            );
+
+            scheduleRefresh();
+            return true;
+
+        } catch (error) {
+            console.error("Refresh error:", error);
+            return false;
+        }
+    })();
+
+    try {
+        return await refreshPromise;
+    } finally {
+        refreshPromise = null;
+    }
+}
+
+// Automatically refresh before token expires
+function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+
+    const token = localStorage.getItem("accessToken");
+    if (!token) return;
+
+    const delay = Math.max(
+        0,
+        getTokenExpiry(token) - Date.now() - 60000
+    );
+
+    refreshTimer = setTimeout(async () => {
+        const success = await refreshAccessToken();
+
+        if (success) {
+            connectWebSocket();
+        } else {
+            disconnectWebSocket();
+            clearTokens();
+            showLogin("Session expired. Please log in again.");
+        }
+    }, delay);
+}
+
+// Connect to WebSocket
+async function connectWebSocket() {
+    let token = localStorage.getItem("accessToken");
+
+    if (tokenExpired(token)) {
+        const success = await refreshAccessToken();
+
+        if (!success) {
+            disconnectWebSocket();
+            clearTokens();
+            showLogin("Session expired. Please log in again.");
+            return;
+        }
+
+        token = localStorage.getItem("accessToken");
+    }
+
+    if (socket && socket.readyState === WebSocket.CONNECTING) {
         return;
     }
 
-    if (socket) {
-        socket.onclose = null;
-        socket.close();
-    }
+    disconnectWebSocket();
 
     updateStatus("Connecting...");
     showMessage("Connecting to WebSocket...");
 
-    socket = new WebSocket(
+    const ws = new WebSocket(
         `${WS_URL}?token=${encodeURIComponent(token)}`
     );
 
-    socket.onopen = () => {
+    socket = ws;
+
+    ws.onopen = () => {
+        if (socket !== ws) return;
+
         updateStatus("Connected", true);
         showMessage("Connected to WebSocket!");
     };
 
-    socket.onmessage = (event) => {
+    ws.onmessage = (event) => {
+        if (socket !== ws) return;
+
         try {
             const data = JSON.parse(event.data);
 
@@ -93,15 +220,26 @@ function connectWebSocket() {
         }
     };
 
-    socket.onerror = () => {
+    ws.onerror = () => {
+        if (socket !== ws) return;
         showMessage("WebSocket connection error.");
     };
 
-    socket.onclose = () => {
+    ws.onclose = async () => {
+        if (socket !== ws) return;
+
+        socket = null;
         updateStatus("Disconnected");
 
         if (tokenExpired(token)) {
-            localStorage.removeItem("accessToken");
+            const success = await refreshAccessToken();
+
+            if (success) {
+                connectWebSocket();
+                return;
+            }
+
+            clearTokens();
             showLogin("Session expired. Please log in again.");
         } else {
             showMessage("Disconnected. Click Reconnect to try again.");
@@ -134,12 +272,12 @@ loginForm.addEventListener("submit", async (event) => {
 
         const data = await response.json();
 
-        if (!data.jwt) {
-            loginMessage.textContent = "No token received.";
+        if (!data.jwtAccess || !data.jwtRef) {
+            loginMessage.textContent = "Login tokens missing.";
             return;
         }
 
-        localStorage.setItem("accessToken", data.jwt);
+        saveTokens(data.jwtAccess, data.jwtRef);
 
         loginSection.hidden = true;
         pastebinSection.hidden = false;
@@ -147,6 +285,7 @@ loginForm.addEventListener("submit", async (event) => {
         loginMessage.textContent = "";
         loginForm.reset();
 
+        scheduleRefresh();
         connectWebSocket();
 
     } catch (error) {
@@ -186,30 +325,68 @@ reconnectBtn.addEventListener("click", () => {
     connectWebSocket();
 });
 
-// Logout
-logoutBtn.addEventListener("click", () => {
-    if (socket) {
-        socket.onclose = null;
-        socket.close();
-        socket = null;
+// Logout through API
+logoutBtn.addEventListener("click", async () => {
+    const refreshToken = localStorage.getItem("refreshToken");
+
+    logoutBtn.disabled = true;
+
+    try {
+        if (refreshToken) {
+            const response = await fetch(`${API_URL}/refresh`, {
+                method: "DELETE",
+                headers: {
+                    "jwtRef": `Bearer ${refreshToken}`
+                }
+            });
+
+            if (!response.ok) {
+                showMessage("Logout failed. Please try again.");
+                return;
+            }
+        }
+
+        disconnectWebSocket();
+        clearTokens();
+
+        loginForm.reset();
+        textInput.value = "";
+        showLogin();
+
+    } catch (error) {
+        showMessage("Could not connect to logout server.");
+        console.error(error);
+    } finally {
+        logoutBtn.disabled = false;
     }
-
-    localStorage.removeItem("accessToken");
-
-    loginForm.reset();
-    textInput.value = "";
-
-    showLogin();
 });
 
-// Check saved login on page load
-const savedToken = localStorage.getItem("accessToken");
+// Check saved login on startup
+async function startApp() {
+    const accessToken = localStorage.getItem("accessToken");
+    const refreshToken = localStorage.getItem("refreshToken");
 
-if (savedToken && !tokenExpired(savedToken)) {
+    if (!refreshToken || tokenExpired(refreshToken)) {
+        clearTokens();
+        showLogin();
+        return;
+    }
+
+    if (!accessToken || tokenExpired(accessToken)) {
+        const success = await refreshAccessToken();
+
+        if (!success) {
+            clearTokens();
+            showLogin("Session expired. Please log in again.");
+            return;
+        }
+    }
+
     loginSection.hidden = true;
     pastebinSection.hidden = false;
+
+    scheduleRefresh();
     connectWebSocket();
-} else {
-    localStorage.removeItem("accessToken");
-    showLogin();
 }
+
+startApp();
